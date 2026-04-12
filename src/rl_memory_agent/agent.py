@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union
 
 import numpy as np
 
@@ -64,15 +64,21 @@ class AgentRunner:
 
             if self.buffer.full:
                 batch = self.buffer.get()
-                update_metrics = self.algo.update(batch)
+                last_value = self.algo.predict_value(self.obs)
+                update_metrics = self.algo.update(batch, last_value=last_value)
+                self.buffer.reset()
                 self.updates += 1
 
                 mean_r = float(np.mean(recent_rewards[-self.train.rollout_steps :]))
                 mean_c = float(np.mean(recent_costs[-self.train.rollout_steps :]))
                 if self.updates % self.train.log_every == 0:
+                    lam: Union[float, list[float]] = update_metrics["lambda"]  # type: ignore[assignment]
+                    if isinstance(lam, list):
+                        lam_s = "[" + ",".join(f"{x:.3f}" for x in lam) + "]"
+                    else:
+                        lam_s = f"{float(lam):.3f}"
                     print(
                         f"update={self.updates:04d} step={self.step:07d} "
                         f"mean_reward={mean_r:+.4f} mean_cost={mean_c:.4f} "
-                        f"lambda={update_metrics['lambda']:.3f}"
+                        f"lambda={lam_s}"
                     )
-

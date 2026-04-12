@@ -5,6 +5,7 @@ import argparse
 from rl_memory_agent.agent import AgentRunner, TrainConfig
 from rl_memory_agent.env import ToyEnvConfig, ToyMemoryEnv
 from rl_memory_agent.ppo_lagrangian import LagrangianConfig, LagrangianPPO, PPOConfig
+from rl_memory_agent.simgrid_online import add_simgrid_subcommand
 
 
 def _cmd_toy(args: argparse.Namespace) -> None:
@@ -43,10 +44,11 @@ def main() -> None:
     p_actions = sub.add_parser("actions", help="List available knob actions.")
     p_actions.set_defaults(func=_cmd_actions)
 
+    add_simgrid_subcommand(sub)
+
     args = parser.parse_args()
     args.func(args)
 
 
 if __name__ == "__main__":
     main()
-

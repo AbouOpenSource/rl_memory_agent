@@ -28,3 +28,31 @@ The intended integration is to wrap an existing training loop and provide:
 See `src/rl_memory_agent/env.py` and `src/rl_memory_agent/safety.py` for the interfaces and the
 expected data flow.
 
+## End-to-end experiments (real training)
+
+See `EXPERIMENTS.md` for a concrete end-to-end evaluation protocol (baselines, scenarios, metrics)
+and a minimal integration checklist.
+
+## Online training with SimGrid (simulated cluster)
+
+If you run the SimGrid cluster environment in external-controller mode, the agent can connect and
+train online from the simulator telemetry:
+
+```bash
+# Terminal A (simulator)
+./simgrid_cluster_env/build/cluster_env simgrid_cluster_env/platforms/cluster_4hosts.xml \
+  --mode online --controller external --control-port 5555 --control-interval 10
+
+# Terminal B (agent)
+cd rl_memory_agent
+python -m pip install -e .
+rl-memory-agent simgrid --host 127.0.0.1 --port 5555 --rollout-steps 256
+```
+
+Multi-constraint mode (vector costs) is supported via `--cost-components` and `--cost-limits`:
+
+```bash
+rl-memory-agent simgrid \
+  --cost-components mem_overflow,comm_frac,io_frac \
+  --cost-limits 0.0,0.35,0.10
+```
