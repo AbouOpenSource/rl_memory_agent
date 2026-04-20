@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import socket
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -25,6 +27,8 @@ class SimGridHello:
     micro_batch_max: int
     grad_accum_min: int
     grad_accum_max: int
+    ckpt_interval_min: int
+    ckpt_interval_max: int
     bucket_cap_mb_min: int
     bucket_cap_mb_max: int
     precisions: Tuple[str, ...]
@@ -138,6 +142,8 @@ def _hello_from_kv(kv: Dict[str, str]) -> SimGridHello:
     micro_batch_max = max(micro_batch_min, i("micro_batch_max", 64))
     grad_accum_min = max(1, i("grad_accum_min", 1))
     grad_accum_max = max(grad_accum_min, i("grad_accum_max", 32))
+    ckpt_interval_min = max(0, i("ckpt_interval_min", 0))
+    ckpt_interval_max = max(ckpt_interval_min, i("ckpt_interval_max", 10_000))
     bucket_cap_mb_min = max(0, i("bucket_cap_mb_min", 1))
     bucket_cap_mb_max = max(bucket_cap_mb_min, i("bucket_cap_mb_max", 256))
 
@@ -151,6 +157,8 @@ def _hello_from_kv(kv: Dict[str, str]) -> SimGridHello:
         micro_batch_max=micro_batch_max,
         grad_accum_min=grad_accum_min,
         grad_accum_max=grad_accum_max,
+        ckpt_interval_min=ckpt_interval_min,
+        ckpt_interval_max=ckpt_interval_max,
         bucket_cap_mb_min=bucket_cap_mb_min,
         bucket_cap_mb_max=bucket_cap_mb_max,
         precisions=precisions,
@@ -193,7 +201,7 @@ def _telemetry_from_kv(kv: Dict[str, str], *, action_space: KnobActionSpace) -> 
         precision=str(kv.get("precision", "fp32")),
         sharding=str(kv.get("sharding", "ddp")),
         bucket_cap_mb=i("bucket_cap_mb", 25),
-        ckpt_interval_steps=0,
+        ckpt_interval_steps=i("ckpt_interval_steps", 0),
     ).clipped(action_space.constraints)
 
     return SimGridTelemetry(
@@ -218,6 +226,7 @@ def _config_line(config: KnobConfig) -> str:
         "CONFIG"
         f" micro_batch={int(config.micro_batch)}"
         f" grad_accum_steps={int(config.grad_accum_steps)}"
+        f" ckpt_interval_steps={int(config.ckpt_interval_steps)}"
         f" bucket_cap_mb={int(config.bucket_cap_mb)}"
         f" precision={config.precision}"
         f" activation_checkpointing={1 if config.activation_checkpointing else 0}"
@@ -262,6 +271,9 @@ def run_simgrid_online_controller(
     headroom_margin: Optional[float],
     device: str,
     log_every: int,
+    checkpoint_dir: Optional[str],
+    save_every_updates: int,
+    resume_from: Optional[str],
 ) -> None:
     if not cost_components:
         raise ValueError("cost_components must be non-empty")
@@ -270,6 +282,8 @@ def run_simgrid_online_controller(
             raise ValueError(f"unsupported cost component: {name!r} (supported: {sorted(_SUPPORTED_COST_COMPONENTS)})")
     if len(cost_limits) != len(cost_components):
         raise ValueError("cost_limits must have the same length as cost_components")
+    if int(save_every_updates) < 0:
+        raise ValueError("save_every_updates must be >= 0")
 
     with socket.create_connection((host, int(port))) as sock:
         hello_line = _recv_line(sock)
@@ -286,6 +300,8 @@ def run_simgrid_online_controller(
             micro_batch_max=hello.micro_batch_max,
             grad_accum_min=hello.grad_accum_min,
             grad_accum_max=hello.grad_accum_max,
+            ckpt_interval_min=hello.ckpt_interval_min,
+            ckpt_interval_max=hello.ckpt_interval_max,
             bucket_cap_mb_min=hello.bucket_cap_mb_min,
             bucket_cap_mb_max=hello.bucket_cap_mb_max,
             precisions=hello.precisions,
@@ -309,6 +325,7 @@ def run_simgrid_online_controller(
         updates = 0
         recent_rewards: List[float] = []
         recent_costs: List[np.ndarray] = []
+        resume_path = resume_from
 
         while True:
             line = _recv_line(sock)
@@ -348,6 +365,19 @@ def run_simgrid_online_controller(
                 )
                 buffer = RolloutBuffer(obs_dim=int(obs.shape[0]), size=int(rollout_steps), n_costs=len(cost_components))
                 print(f"cost_components={','.join(cost_components)} cost_limits={','.join(str(x) for x in cost_limits)}")
+                if resume_path:
+                    if not os.path.isfile(resume_path):
+                        raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+                    extra = algo.load_checkpoint(resume_path)
+                    restored_updates = int(extra.get("updates", 0)) if isinstance(extra, dict) else 0
+                    restored_decisions = int(extra.get("decisions", 0)) if isinstance(extra, dict) else 0
+                    updates = max(updates, restored_updates)
+                    decisions = max(decisions, restored_decisions)
+                    print(
+                        f"resumed_from={resume_path} restored_updates={restored_updates} "
+                        f"restored_decisions={restored_decisions}"
+                    )
+                    resume_path = None
 
             assert algo is not None
             assert buffer is not None
@@ -391,6 +421,20 @@ def run_simgrid_online_controller(
                             f"lambda={_fmt_scalar_or_list(metrics['lambda'])}"
                         )
 
+                    if checkpoint_dir and int(save_every_updates) > 0 and (updates % int(save_every_updates) == 0):
+                        os.makedirs(checkpoint_dir, exist_ok=True)
+                        ckpt_path = os.path.join(checkpoint_dir, f"update_{updates:06d}.pt")
+                        extra = {
+                            "updates": int(updates),
+                            "decisions": int(decisions),
+                            "cost_components": list(cost_components),
+                            "cost_limits": [float(x) for x in cost_limits],
+                        }
+                        algo.save_checkpoint(ckpt_path, extra=extra)
+                        latest_path = os.path.join(checkpoint_dir, "latest.pt")
+                        shutil.copyfile(ckpt_path, latest_path)
+                        print(f"checkpoint_saved={ckpt_path}")
+
             # Record last safe configuration from observed outcomes.
             limit_mb = hello.budget_mb * (1.0 - safety.headroom_margin)
             if (not telemetry.any_oom) and (telemetry.max_peak_mb <= limit_mb):
@@ -416,6 +460,20 @@ def run_simgrid_online_controller(
             pending = (obs, action_id, log_prob, value)
             decisions += 1
 
+        if checkpoint_dir and algo is not None:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            final_path = os.path.join(checkpoint_dir, "final.pt")
+            extra = {
+                "updates": int(updates),
+                "decisions": int(decisions),
+                "cost_components": list(cost_components),
+                "cost_limits": [float(x) for x in cost_limits],
+            }
+            algo.save_checkpoint(final_path, extra=extra)
+            latest_path = os.path.join(checkpoint_dir, "latest.pt")
+            shutil.copyfile(final_path, latest_path)
+            print(f"checkpoint_saved={final_path}")
+
 
 def add_simgrid_subcommand(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser("simgrid", help="Train online by controlling a SimGrid cluster env (external controller).")
@@ -440,6 +498,14 @@ def add_simgrid_subcommand(sub: argparse._SubParsersAction[argparse.ArgumentPars
     p.add_argument("--headroom-margin", type=float, default=None)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--checkpoint-dir", type=str, default=None, help="Directory to periodically save agent checkpoints.")
+    p.add_argument(
+        "--save-every-updates",
+        type=int,
+        default=0,
+        help="Save checkpoint every N PPO updates (0 disables periodic saves).",
+    )
+    p.add_argument("--resume-from", type=str, default=None, help="Path to a checkpoint file to resume from.")
 
     def _run(args: argparse.Namespace) -> None:
         comps = _parse_csv_list(str(args.cost_components), default=("mem_overflow",))
@@ -466,6 +532,9 @@ def add_simgrid_subcommand(sub: argparse._SubParsersAction[argparse.ArgumentPars
             headroom_margin=None if args.headroom_margin is None else float(args.headroom_margin),
             device=str(args.device),
             log_every=int(args.log_every),
+            checkpoint_dir=None if args.checkpoint_dir is None else str(args.checkpoint_dir),
+            save_every_updates=int(args.save_every_updates),
+            resume_from=None if args.resume_from is None else str(args.resume_from),
         )
 
     p.set_defaults(func=_run)

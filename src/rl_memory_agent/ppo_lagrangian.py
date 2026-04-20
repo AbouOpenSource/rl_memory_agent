@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Sequence, Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -295,3 +295,39 @@ class LagrangianPPO:
             "value_loss": value_loss_acc / updates,
             "entropy": entropy_acc / updates,
         }
+
+    def checkpoint_payload(self, *, extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "checkpoint_version": 1,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optim.state_dict(),
+            "lambda_dual": self.lambda_dual.tolist(),
+            "cost_limits": self.cost_limits.tolist(),
+            "ppo_config": self.ppo.__dict__.copy(),
+            "lagrangian_config": self.lagrangian.__dict__.copy(),
+        }
+        if extra is not None:
+            payload["extra"] = dict(extra)
+        return payload
+
+    def save_checkpoint(self, path: str, *, extra: Dict[str, Any] | None = None) -> None:
+        torch.save(self.checkpoint_payload(extra=extra), path)
+
+    def load_checkpoint(self, path: str) -> Dict[str, Any]:
+        payload = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(payload["model_state_dict"])
+
+        optim_state = payload.get("optimizer_state_dict")
+        if optim_state is not None:
+            self.optim.load_state_dict(optim_state)
+
+        lambda_dual = payload.get("lambda_dual")
+        if lambda_dual is not None:
+            self.lambda_dual = np.asarray(lambda_dual, dtype=np.float32)
+
+        cost_limits = payload.get("cost_limits")
+        if cost_limits is not None:
+            self.cost_limits = np.asarray(cost_limits, dtype=np.float32)
+
+        extra = payload.get("extra")
+        return dict(extra) if isinstance(extra, dict) else {}

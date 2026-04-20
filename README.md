@@ -56,3 +56,23 @@ rl-memory-agent simgrid \
   --cost-components mem_overflow,comm_frac,io_frac \
   --cost-limits 0.0,0.35,0.10
 ```
+
+Checkpointing (periodic agent snapshots) is supported during online training:
+
+```bash
+rl-memory-agent simgrid \
+  --host 127.0.0.1 --port 5555 \
+  --rollout-steps 256 \
+  --checkpoint-dir runs/agent_ckpts \
+  --save-every-updates 20
+```
+
+You can resume from the latest saved checkpoint:
+
+```bash
+rl-memory-agent simgrid \
+  --host 127.0.0.1 --port 5555 \
+  --resume-from runs/agent_ckpts/latest.pt \
+  --checkpoint-dir runs/agent_ckpts \
+  --save-every-updates 20
+```
