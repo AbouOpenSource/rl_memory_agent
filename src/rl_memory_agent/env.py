@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 from rl_memory_agent.knobs import KnobActionSpace, KnobConfig, KnobConstraints
+from rl_memory_agent.reward import RewardConfig, compute_reward
 from rl_memory_agent.safety import SafetyShield
 from rl_memory_agent.state import StateBuilder
 from rl_memory_agent.telemetry import TelemetrySample, TelemetryWindow
@@ -34,7 +35,13 @@ class ToyEnvConfig:
     io_bandwidth_mb_s: float = 600.0
     ckpt_size_mb: float = 4_000.0
     oom_penalty: float = 5.0
+    restart_penalty: float = 0.0
     noise_std_mb: float = 50.0
+    reward_mode: str = "neg_step_time"
+    sequence_length: int = 1
+    loss_delta_per_update: float = 1.0
+    reward_log_progress: bool = True
+    reward_scale: float = 1.0
 
 
 class ToyMemoryEnv:
@@ -97,13 +104,28 @@ class ToyMemoryEnv:
         self.telemetry.append(sample)
         self.step_idx += 1
 
-        # Reward: negative step time (maximize speed). Cost: overflow ratio (>=0).
-        reward = -float(sample.step_time_s)
+        reward_cfg = RewardConfig(
+            mode=self.cfg.reward_mode,
+            sequence_length=self.cfg.sequence_length,
+            loss_delta_per_update=self.cfg.loss_delta_per_update,
+            log_progress=self.cfg.reward_log_progress,
+            scale=self.cfg.reward_scale,
+            oom_penalty=self.cfg.oom_penalty,
+            restart_penalty=self.cfg.restart_penalty,
+        )
+        reward = compute_reward(
+            config=reward_cfg,
+            elapsed_s=sample.step_time_s,
+            world_size=self.cfg.world_size,
+            micro_batch=proposed.micro_batch,
+            grad_accum_steps=proposed.grad_accum_steps,
+            oom=sample.oom,
+            restart=sample.restart,
+        )
         peak_ratio = float(sample.vram_peak_mb / self.cfg.budget_mb)
         cost = max(0.0, peak_ratio - 1.0)
 
         if sample.oom:
-            reward -= float(self.cfg.oom_penalty)
             # Roll back to last safe configuration if available.
             safe = self.safety.last_safe_config()
             if safe is not None:
@@ -169,4 +191,3 @@ class ToyMemoryEnv:
             oom=oom,
             restart=False,
         )
-

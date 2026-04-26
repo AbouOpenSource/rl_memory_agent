@@ -11,6 +11,7 @@ import numpy as np
 
 from rl_memory_agent.knobs import KnobActionSpace, KnobConfig, KnobConstraints
 from rl_memory_agent.ppo_lagrangian import LagrangianConfig, LagrangianPPO, PPOConfig, RolloutBuffer
+from rl_memory_agent.reward import REWARD_MODES, RewardConfig, compute_reward
 from rl_memory_agent.safety import SafetyShield
 from rl_memory_agent.state import StateBuilder
 from rl_memory_agent.telemetry import TelemetrySample, TelemetryWindow
@@ -267,7 +268,13 @@ def run_simgrid_online_controller(
     window_len: int,
     cost_components: Tuple[str, ...],
     cost_limits: Tuple[float, ...],
+    reward_mode: str,
+    sequence_length: int,
+    loss_delta_per_update: float,
+    reward_log_progress: bool,
+    reward_scale: float,
     oom_penalty: float,
+    restart_penalty: float,
     headroom_margin: Optional[float],
     device: str,
     log_every: int,
@@ -282,6 +289,8 @@ def run_simgrid_online_controller(
             raise ValueError(f"unsupported cost component: {name!r} (supported: {sorted(_SUPPORTED_COST_COMPONENTS)})")
     if len(cost_limits) != len(cost_components):
         raise ValueError("cost_limits must have the same length as cost_components")
+    if reward_mode not in REWARD_MODES:
+        raise ValueError(f"unsupported reward_mode: {reward_mode!r} (supported: {REWARD_MODES})")
     if int(save_every_updates) < 0:
         raise ValueError("save_every_updates must be >= 0")
 
@@ -314,6 +323,15 @@ def run_simgrid_online_controller(
         safety = SafetyShield(
             budget_mb=hello.budget_mb,
             headroom_margin=float(hello.headroom_margin if headroom_margin is None else headroom_margin),
+        )
+        reward_cfg = RewardConfig(
+            mode=reward_mode,
+            sequence_length=max(1, int(sequence_length)),
+            loss_delta_per_update=float(loss_delta_per_update),
+            log_progress=bool(reward_log_progress),
+            scale=float(reward_scale),
+            oom_penalty=float(oom_penalty),
+            restart_penalty=float(restart_penalty),
         )
 
         # We will initialize algo lazily after receiving the first telemetry and building an obs.
@@ -365,6 +383,10 @@ def run_simgrid_online_controller(
                 )
                 buffer = RolloutBuffer(obs_dim=int(obs.shape[0]), size=int(rollout_steps), n_costs=len(cost_components))
                 print(f"cost_components={','.join(cost_components)} cost_limits={','.join(str(x) for x in cost_limits)}")
+                print(
+                    f"reward_mode={reward_cfg.mode} sequence_length={reward_cfg.sequence_length} "
+                    f"reward_log_progress={int(reward_cfg.log_progress)} reward_scale={reward_cfg.scale}"
+                )
                 if resume_path:
                     if not os.path.isfile(resume_path):
                         raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
@@ -383,10 +405,16 @@ def run_simgrid_online_controller(
             assert buffer is not None
 
             # Reward/cost observed for the *interval that just ended* (config chosen previously).
-            reward = -float(telemetry.mean_step_s)
+            reward = compute_reward(
+                config=reward_cfg,
+                elapsed_s=telemetry.mean_step_s,
+                world_size=hello.world_size,
+                micro_batch=telemetry.knobs.micro_batch,
+                grad_accum_steps=telemetry.knobs.grad_accum_steps,
+                oom=telemetry.any_oom,
+                restart=telemetry.any_restart,
+            )
             cost = _cost_vector(telemetry, hello, components=cost_components)
-            if telemetry.any_oom:
-                reward -= float(oom_penalty)
 
             if pending is not None:
                 prev_obs, prev_action, prev_log_prob, prev_value = pending
@@ -429,6 +457,8 @@ def run_simgrid_online_controller(
                             "decisions": int(decisions),
                             "cost_components": list(cost_components),
                             "cost_limits": [float(x) for x in cost_limits],
+                            "reward_mode": reward_cfg.mode,
+                            "sequence_length": int(reward_cfg.sequence_length),
                         }
                         algo.save_checkpoint(ckpt_path, extra=extra)
                         latest_path = os.path.join(checkpoint_dir, "latest.pt")
@@ -468,6 +498,8 @@ def run_simgrid_online_controller(
                 "decisions": int(decisions),
                 "cost_components": list(cost_components),
                 "cost_limits": [float(x) for x in cost_limits],
+                "reward_mode": reward_cfg.mode,
+                "sequence_length": int(reward_cfg.sequence_length),
             }
             algo.save_checkpoint(final_path, extra=extra)
             latest_path = os.path.join(checkpoint_dir, "latest.pt")
@@ -494,7 +526,28 @@ def add_simgrid_subcommand(sub: argparse._SubParsersAction[argparse.ArgumentPars
         default=None,
         help="Comma-separated floats aligned with --cost-components (defaults are used when omitted).",
     )
+    p.add_argument(
+        "--reward-mode",
+        choices=REWARD_MODES,
+        default="neg_step_time",
+        help="Scalar reward objective: legacy negative step time or useful progress per second.",
+    )
+    p.add_argument("--sequence-length", type=int, default=1, help="Tokens per sample for tokens_per_second reward.")
+    p.add_argument(
+        "--loss-delta-per-update",
+        type=float,
+        default=1.0,
+        help="Loss-progress proxy for loss_delta_per_second reward; real integrations should pass measured loss delta.",
+    )
+    p.add_argument("--reward-scale", type=float, default=1.0, help="Divisor applied before reward transform.")
+    p.add_argument(
+        "--no-reward-log-progress",
+        dest="reward_log_progress",
+        action="store_false",
+        help="Use raw progress/sec rewards instead of log1p(progress/sec).",
+    )
     p.add_argument("--oom-penalty", type=float, default=5.0)
+    p.add_argument("--restart-penalty", type=float, default=0.0)
     p.add_argument("--headroom-margin", type=float, default=None)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--log-every", type=int, default=10)
@@ -528,7 +581,13 @@ def add_simgrid_subcommand(sub: argparse._SubParsersAction[argparse.ArgumentPars
             window_len=int(args.window_len),
             cost_components=comps,
             cost_limits=limits,
+            reward_mode=str(args.reward_mode),
+            sequence_length=int(args.sequence_length),
+            loss_delta_per_update=float(args.loss_delta_per_update),
+            reward_log_progress=bool(args.reward_log_progress),
+            reward_scale=float(args.reward_scale),
             oom_penalty=float(args.oom_penalty),
+            restart_penalty=float(args.restart_penalty),
             headroom_margin=None if args.headroom_margin is None else float(args.headroom_margin),
             device=str(args.device),
             log_every=int(args.log_every),
@@ -537,4 +596,4 @@ def add_simgrid_subcommand(sub: argparse._SubParsersAction[argparse.ArgumentPars
             resume_from=None if args.resume_from is None else str(args.resume_from),
         )
 
-    p.set_defaults(func=_run)
+    p.set_defaults(func=_run, reward_log_progress=True)
