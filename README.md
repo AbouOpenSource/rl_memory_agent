@@ -57,6 +57,17 @@ rl-memory-agent simgrid \
   --cost-limits 0.0,0.35,0.10
 ```
 
+For more stable early training, restrict the policy to fast online knobs and penalize configuration
+churn:
+
+```bash
+rl-memory-agent simgrid \
+  --action-profile fast_only \
+  --cost-components mem_overflow,oom,comm_frac,io_frac,switch_cost \
+  --cost-limits 0.0,0.0,0.35,0.10,0.02 \
+  --entropy-coef 0.001
+```
+
 Checkpointing (periodic agent snapshots) is supported during online training:
 
 ```bash

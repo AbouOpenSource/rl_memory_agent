@@ -57,13 +57,14 @@ class ToyMemoryEnv:
         *,
         env_config: ToyEnvConfig | None = None,
         knob_constraints: KnobConstraints | None = None,
+        action_profile: str = "all",
         window_len: int = 20,
         headroom_margin: float = 0.05,
     ) -> None:
         self.cfg = env_config or ToyEnvConfig()
         self.rng = np.random.default_rng(self.cfg.seed)
 
-        self.action_space = KnobActionSpace(knob_constraints or KnobConstraints())
+        self.action_space = KnobActionSpace(knob_constraints or KnobConstraints(), action_profile=action_profile)
         self.state_builder = StateBuilder(budget_mb=self.cfg.budget_mb, action_space=self.action_space)
         self.telemetry = TelemetryWindow(maxlen=window_len)
 

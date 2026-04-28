@@ -9,7 +9,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from rl_memory_agent.knobs import KnobActionSpace, KnobConfig, KnobConstraints
+from rl_memory_agent.knobs import ACTION_PROFILES, KnobActionSpace, KnobConfig, KnobConstraints
 from rl_memory_agent.ppo_lagrangian import LagrangianConfig, LagrangianPPO, PPOConfig, RolloutBuffer
 from rl_memory_agent.reward import REWARD_MODES, RewardConfig, compute_reward
 from rl_memory_agent.safety import SafetyShield
@@ -58,6 +58,7 @@ _SUPPORTED_COST_COMPONENTS = {
     "io_frac",
     "oom",
     "restart",
+    "switch_cost",
 }
 
 _DEFAULT_COST_LIMITS: Dict[str, float] = {
@@ -66,6 +67,7 @@ _DEFAULT_COST_LIMITS: Dict[str, float] = {
     "io_frac": 0.10,
     "oom": 0.0,
     "restart": 0.0,
+    "switch_cost": 0.02,
 }
 
 
@@ -235,7 +237,35 @@ def _config_line(config: KnobConfig) -> str:
     )
 
 
-def _cost_vector(telemetry: SimGridTelemetry, hello: SimGridHello, *, components: Tuple[str, ...]) -> np.ndarray:
+def _knob_switch_cost(previous: KnobConfig | None, current: KnobConfig) -> float:
+    if previous is None:
+        return 0.0
+
+    cost = 0.0
+    if previous.micro_batch != current.micro_batch:
+        cost += 0.02
+    if previous.grad_accum_steps != current.grad_accum_steps:
+        cost += 0.01
+    if previous.bucket_cap_mb != current.bucket_cap_mb:
+        cost += 0.005
+    if previous.ckpt_interval_steps != current.ckpt_interval_steps:
+        cost += 0.02
+    if previous.activation_checkpointing != current.activation_checkpointing:
+        cost += 0.10
+    if previous.precision != current.precision:
+        cost += 0.15
+    if previous.sharding != current.sharding:
+        cost += 0.20
+    return float(min(cost, 1.0))
+
+
+def _cost_vector(
+    telemetry: SimGridTelemetry,
+    hello: SimGridHello,
+    *,
+    components: Tuple[str, ...],
+    switch_from: KnobConfig | None = None,
+) -> np.ndarray:
     step_s = max(1e-6, float(telemetry.mean_step_s))
     out: List[float] = []
     for name in components:
@@ -249,6 +279,8 @@ def _cost_vector(telemetry: SimGridTelemetry, hello: SimGridHello, *, components
             out.append(float(telemetry.any_oom))
         elif name == "restart":
             out.append(float(telemetry.any_restart))
+        elif name == "switch_cost":
+            out.append(_knob_switch_cost(switch_from, telemetry.knobs))
         else:
             raise ValueError(f"unsupported cost component: {name}")
     return np.asarray(out, dtype=np.float32)
@@ -276,6 +308,8 @@ def run_simgrid_online_controller(
     oom_penalty: float,
     restart_penalty: float,
     headroom_margin: Optional[float],
+    action_profile: str,
+    entropy_coef: float,
     device: str,
     log_every: int,
     checkpoint_dir: Optional[str],
@@ -316,7 +350,8 @@ def run_simgrid_online_controller(
             precisions=hello.precisions,
             sharding_modes=hello.sharding_modes,
         )
-        action_space = KnobActionSpace(constraints)
+        action_space = KnobActionSpace(constraints, action_profile=action_profile)
+        noop_action_id = action_space.index("noop")
 
         window = TelemetryWindow(maxlen=int(window_len))
         state_builder = StateBuilder(budget_mb=hello.budget_mb, action_space=action_space)
@@ -338,7 +373,7 @@ def run_simgrid_online_controller(
         algo: Optional[LagrangianPPO] = None
         buffer: Optional[RolloutBuffer] = None
 
-        pending: Optional[Tuple[np.ndarray, int, float, float]] = None
+        pending: Optional[Tuple[np.ndarray, int, float, float, KnobConfig]] = None
         decisions = 0
         updates = 0
         recent_rewards: List[float] = []
@@ -377,7 +412,7 @@ def run_simgrid_online_controller(
                 algo = LagrangianPPO(
                     obs_dim=int(obs.shape[0]),
                     n_actions=action_space.n,
-                    ppo=PPOConfig(),
+                    ppo=PPOConfig(entropy_coef=float(entropy_coef)),
                     lagrangian=LagrangianConfig(cost_limits=tuple(float(x) for x in cost_limits)),
                     device=device,
                 )
@@ -387,6 +422,7 @@ def run_simgrid_online_controller(
                     f"reward_mode={reward_cfg.mode} sequence_length={reward_cfg.sequence_length} "
                     f"reward_log_progress={int(reward_cfg.log_progress)} reward_scale={reward_cfg.scale}"
                 )
+                print(f"action_profile={action_space.action_profile} n_actions={action_space.n} entropy_coef={entropy_coef}")
                 if resume_path:
                     if not os.path.isfile(resume_path):
                         raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
@@ -414,10 +450,15 @@ def run_simgrid_online_controller(
                 oom=telemetry.any_oom,
                 restart=telemetry.any_restart,
             )
-            cost = _cost_vector(telemetry, hello, components=cost_components)
 
             if pending is not None:
-                prev_obs, prev_action, prev_log_prob, prev_value = pending
+                prev_obs, prev_action, prev_log_prob, prev_value, prev_knobs = pending
+                cost = _cost_vector(
+                    telemetry,
+                    hello,
+                    components=cost_components,
+                    switch_from=prev_knobs,
+                )
                 buffer.add(
                     obs=prev_obs,
                     action=prev_action,
@@ -459,6 +500,8 @@ def run_simgrid_online_controller(
                             "cost_limits": [float(x) for x in cost_limits],
                             "reward_mode": reward_cfg.mode,
                             "sequence_length": int(reward_cfg.sequence_length),
+                            "action_profile": action_space.action_profile,
+                            "entropy_coef": float(entropy_coef),
                         }
                         algo.save_checkpoint(ckpt_path, extra=extra)
                         latest_path = os.path.join(checkpoint_dir, "latest.pt")
@@ -473,11 +516,16 @@ def run_simgrid_online_controller(
             # Choose next action (config to apply at the next control boundary).
             action_id, log_prob, value = algo.select_action(obs)
             proposed = action_space.apply(action_id, telemetry.knobs)
+            stored_action_id = int(action_id)
+            stored_log_prob = float(log_prob)
+            stored_value = float(value)
 
             # Safety shield: block risky actions.
             safety_res = safety.check(last=sample, current=telemetry.knobs, proposed=proposed)
             if not safety_res.allowed:
                 proposed = telemetry.knobs
+                stored_action_id = noop_action_id
+                stored_log_prob, stored_value = algo.log_prob_value(obs, stored_action_id)
 
             # Hard rollback if we just observed an OOM/restart.
             if telemetry.any_oom or telemetry.any_restart:
@@ -487,7 +535,7 @@ def run_simgrid_online_controller(
 
             _send_line(sock, _config_line(proposed))
 
-            pending = (obs, action_id, log_prob, value)
+            pending = (obs, stored_action_id, stored_log_prob, stored_value, telemetry.knobs)
             decisions += 1
 
         if checkpoint_dir and algo is not None:
@@ -500,6 +548,8 @@ def run_simgrid_online_controller(
                 "cost_limits": [float(x) for x in cost_limits],
                 "reward_mode": reward_cfg.mode,
                 "sequence_length": int(reward_cfg.sequence_length),
+                "action_profile": action_space.action_profile,
+                "entropy_coef": float(entropy_coef),
             }
             algo.save_checkpoint(final_path, extra=extra)
             latest_path = os.path.join(checkpoint_dir, "latest.pt")
@@ -513,12 +563,13 @@ def add_simgrid_subcommand(sub: argparse._SubParsersAction[argparse.ArgumentPars
     p.add_argument("--port", type=int, default=5555)
     p.add_argument("--rollout-steps", type=int, default=256)
     p.add_argument("--window-len", type=int, default=20)
+    p.add_argument("--action-profile", choices=ACTION_PROFILES, default="fast_only")
     p.add_argument("--cost-limit", type=float, default=0.0)
     p.add_argument(
         "--cost-components",
         type=str,
-        default="mem_overflow",
-        help="Comma-separated list: mem_overflow,comm_frac,io_frac,oom,restart",
+        default="mem_overflow,switch_cost",
+        help="Comma-separated list: mem_overflow,comm_frac,io_frac,oom,restart,switch_cost",
     )
     p.add_argument(
         "--cost-limits",
@@ -549,6 +600,7 @@ def add_simgrid_subcommand(sub: argparse._SubParsersAction[argparse.ArgumentPars
     p.add_argument("--oom-penalty", type=float, default=5.0)
     p.add_argument("--restart-penalty", type=float, default=0.0)
     p.add_argument("--headroom-margin", type=float, default=None)
+    p.add_argument("--entropy-coef", type=float, default=0.001)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-dir", type=str, default=None, help="Directory to periodically save agent checkpoints.")
@@ -589,6 +641,8 @@ def add_simgrid_subcommand(sub: argparse._SubParsersAction[argparse.ArgumentPars
             oom_penalty=float(args.oom_penalty),
             restart_penalty=float(args.restart_penalty),
             headroom_margin=None if args.headroom_margin is None else float(args.headroom_margin),
+            action_profile=str(args.action_profile),
+            entropy_coef=float(args.entropy_coef),
             device=str(args.device),
             log_every=int(args.log_every),
             checkpoint_dir=None if args.checkpoint_dir is None else str(args.checkpoint_dir),

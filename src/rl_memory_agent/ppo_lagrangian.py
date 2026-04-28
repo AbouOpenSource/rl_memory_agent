@@ -19,7 +19,7 @@ class PPOConfig:
     update_epochs: int = 4
     minibatch_size: int = 64
     value_coef: float = 0.5
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.001
     max_grad_norm: float = 0.5
 
 
@@ -191,6 +191,14 @@ class LagrangianPPO:
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         _logits, value = self.model.forward(obs_t)
         return float(value.item())
+
+    @torch.no_grad()
+    def log_prob_value(self, obs: np.ndarray, action: int) -> Tuple[float, float]:
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        action_t = torch.as_tensor([int(action)], dtype=torch.int64, device=self.device)
+        logits, value = self.model.forward(obs_t)
+        dist = Categorical(logits=logits)
+        return float(dist.log_prob(action_t).item()), float(value.item())
 
     def update(self, batch: Dict[str, np.ndarray], *, last_value: float = 0.0) -> Dict[str, float | list[float]]:
         rewards = batch["rewards"]

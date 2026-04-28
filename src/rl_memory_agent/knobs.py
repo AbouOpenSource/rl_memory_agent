@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Callable, List, Sequence
 
 
+ACTION_PROFILES = ("all", "fast_only")
+
+
 @dataclass(frozen=True)
 class KnobConstraints:
     micro_batch_min: int = 1
@@ -60,8 +63,11 @@ class KnobAction:
 
 
 class KnobActionSpace:
-    def __init__(self, constraints: KnobConstraints | None = None) -> None:
+    def __init__(self, constraints: KnobConstraints | None = None, *, action_profile: str = "all") -> None:
+        if action_profile not in ACTION_PROFILES:
+            raise ValueError(f"unsupported action_profile={action_profile!r}; supported={ACTION_PROFILES}")
         self.constraints = constraints or KnobConstraints()
+        self.action_profile = action_profile
         self._actions: List[KnobAction] = self._build_default_actions()
 
     def _build_default_actions(self) -> List[KnobAction]:
@@ -126,6 +132,19 @@ class KnobActionSpace:
             KnobAction("ckpt_interval_plus200", ckpt_interval_up),
             KnobAction("ckpt_interval_minus200", ckpt_interval_down),
         ]
+
+        if self.action_profile == "fast_only":
+            fast_names = {
+                "noop",
+                "micro_batch_x2",
+                "micro_batch_half",
+                "grad_accum_plus1",
+                "grad_accum_minus1",
+                "bucket_plus16mb",
+                "bucket_minus16mb",
+            }
+            actions = [a for a in actions if a.name in fast_names]
+
         return actions
 
     @property
@@ -135,9 +154,14 @@ class KnobActionSpace:
     def names(self) -> List[str]:
         return [a.name for a in self._actions]
 
+    def index(self, name: str) -> int:
+        for i, action in enumerate(self._actions):
+            if action.name == name:
+                return i
+        raise ValueError(f"unknown action name for profile {self.action_profile!r}: {name!r}")
+
     def apply(self, action_id: int, config: KnobConfig) -> KnobConfig:
         if not (0 <= action_id < self.n):
             raise IndexError(f"action_id must be in [0, {self.n}), got {action_id}")
         action = self._actions[action_id]
         return action.apply(config, self.constraints)
-
